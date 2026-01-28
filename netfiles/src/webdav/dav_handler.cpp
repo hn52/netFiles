@@ -1,0 +1,567 @@
+﻿#include "dav_handler.hpp"
+#include "core/utils.hpp"
+#include <iostream>
+#include <boost/asio.hpp>
+#include "stringUtil.h"
+
+namespace webdav {
+
+DavRequestHandler::DavRequestHandler(boost::asio::ip::tcp::socket socket,
+                                     const boost::asio::any_io_executor& io_context,
+                                     std::shared_ptr<core::IAsyncFileSystem> fs,
+                                     const std::filesystem::path& root)
+    : socket_(std::move(socket))
+    , io_context_(io_context)
+    , file_system_(std::move(fs))
+    , root_(root)
+    , resource_factory_(io_context, file_system_)
+{
+    resource_factory_.set_root(root);
+}
+
+boost::asio::awaitable<void> DavRequestHandler::handle_request() {
+    auto self = shared_from_this();
+    
+    utils::log_info("WebDAV client connected from: " + 
+        socket_.remote_endpoint().address().to_string());
+    
+    try {
+        while (true) {
+            auto result = co_await HttpParser::parse_request(socket_, buffer_);
+            
+            if (result.has_value()) {
+                HttpRequest request = std::move(result.value());
+                
+                HttpResponse response;
+                
+                // 根据方法分发处理
+                switch (request.method) {
+                    case HttpMethod::GET:
+                        response = co_await process_get(request);
+                        break;
+                    case HttpMethod::HEAD:
+                        response = co_await process_head(request);
+                        break;
+                    case HttpMethod::PUT:
+                        response = co_await process_put(request);
+                        break;
+                    case HttpMethod::DELETE_:
+                        response = co_await process_delete(request);
+                        break;
+                    case HttpMethod::MKCOL:
+                        response = co_await process_mkcol(request);
+                        break;
+                    case HttpMethod::PROPFIND:
+                        response = co_await process_propfind(request);
+                        break;
+                    case HttpMethod::PROPPATCH:
+                        response = co_await process_proppatch(request);
+                        break;
+                    case HttpMethod::COPY:
+                        response = co_await process_copy(request);
+                        break;
+                    case HttpMethod::MOVE:
+                        response = co_await process_move(request);
+                        break;
+                    case HttpMethod::LOCK:
+                        response = co_await process_lock(request);
+                        break;
+                    case HttpMethod::UNLOCK:
+                        response = co_await process_unlock(request);
+                        break;
+                    case HttpMethod::OPTIONS:
+                        response = co_await process_options(request);
+                        break;
+                    default:
+                        response = method_not_allowed();
+                        break;
+                }
+                
+                // 发送响应
+                std::string response_str = HttpParser::generate_response(response);
+                /*std::u8string utf8_message = StringUtil::encode<char8_t, char>(response_str);
+                std::string sv = (char*)utf8_message.c_str();*/
+                co_await boost::asio::async_write(socket_,
+                    boost::asio::buffer(response_str),
+                    boost::asio::use_awaitable);
+                
+                // 对于非持久连接，在处理完HTTP/1.0请求后关闭
+                if (request.version == HttpVersion::HTTP10) {
+                    break;
+                }
+            } else {
+                // 解析错误
+                utils::log_error("HTTP parse error: " + 
+                    std::string(result.error()));
+                break;
+            }
+        }
+    } catch (const std::exception& e) {
+        utils::log_error("Handler error: " + std::string(e.what()));
+    }
+    
+    utils::log_info("WebDAV client disconnected");
+    co_return;
+}
+
+std::filesystem::path DavRequestHandler::resolve_path(std::string_view request_path) {
+    std::string decoded = HttpParser::decode_url(request_path);
+    
+    // 处理规范化
+    std::filesystem::path path = root_ / decoded.substr(1); // 去除前导/
+    std::error_code ec;
+    auto canonical = std::filesystem::canonical(path, ec);
+    
+    if (ec) {
+        return {};
+    }
+    
+    // 验证在root目录下
+    auto root_canonical = std::filesystem::canonical(root_, ec);
+    if (ec || canonical.string().find(root_canonical.string()) != 0) {
+        return {};
+    }
+    
+    return canonical;
+}
+
+HttpResponse DavRequestHandler::method_not_allowed() {
+    HttpResponse response;
+    response.status_code = 405;
+    response.status_message = "Method Not Allowed";
+    response.set_header("Allow", "GET, HEAD, PUT, DELETE, MKCOL, PROPFIND, "
+        "PROPPATCH, COPY, MOVE, LOCK, UNLOCK, OPTIONS");
+    return response;
+}
+
+HttpResponse DavRequestHandler::not_found() {
+    HttpResponse response;
+    response.status_code = 404;
+    response.status_message = "Not Found";
+    response.body = "Resource not found";
+    response.set_header("Content-Type", "text/plain");
+    response.set_header("Content-Length", std::to_string(response.body.size()));
+    return response;
+}
+
+HttpResponse DavRequestHandler::forbidden() {
+    HttpResponse response;
+    response.status_code = 403;
+    response.status_message = "Forbidden";
+    response.body = "Access denied";
+    response.set_header("Content-Type", "text/plain");
+    response.set_header("Content-Length", std::to_string(response.body.size()));
+    return response;
+}
+
+HttpResponse DavRequestHandler::precondition_failed(std::string_view message) {
+    HttpResponse response;
+    response.status_code = 412;
+    response.status_message = "Precondition Failed";
+    response.body = std::string(message);
+    response.set_header("Content-Type", "text/plain");
+    response.set_header("Content-Length", std::to_string(response.body.size()));
+    return response;
+}
+
+// ============ 方法处理实现 ============
+
+boost::asio::awaitable<HttpResponse> 
+DavRequestHandler::process_get(const HttpRequest& request) {
+    auto path = resolve_path(request.path);
+    
+    if (path.empty()) {
+        co_return not_found();
+    }
+    
+    auto resource = resource_factory_.create(path);
+    if (!resource) {
+        co_return not_found();
+    }
+    
+    HttpResponse response;
+    response.status_code = 200;
+    response.status_message = "OK";
+    response.set_header("Content-Type", "application/octet-stream");
+    response.set_header("Content-Length", std::to_string(resource->get_size()));
+    
+    // 发送响应头
+    std::string head = HttpParser::generate_response(response);
+    co_await boost::asio::async_write(socket_,
+        boost::asio::buffer(head),
+        boost::asio::use_awaitable);
+    
+    // 发送文件内容
+    std::ostringstream output;
+    co_await resource->get(output);
+    
+    std::string body = output.str();
+    co_await boost::asio::async_write(socket_,
+        boost::asio::buffer(body),
+        boost::asio::use_awaitable);
+    
+    co_return response;
+}
+
+boost::asio::awaitable<HttpResponse> 
+DavRequestHandler::process_head(const HttpRequest& request) {
+    auto path = resolve_path(request.path);
+    
+    if (path.empty()) {
+        co_return not_found();
+    }
+    
+    auto resource = resource_factory_.create(path);
+    if (!resource) {
+        co_return not_found();
+    }
+    
+    HttpResponse response;
+    response.status_code = 200;
+    response.status_message = "OK";
+    response.set_header("Content-Type", "application/octet-stream");
+    response.set_header("Content-Length", std::to_string(resource->get_size()));
+    
+    co_return response;
+}
+
+boost::asio::awaitable<HttpResponse> 
+DavRequestHandler::process_put(const HttpRequest& request) {
+    auto path = resolve_path(request.path);
+    
+    if (path.empty()) {
+        co_return not_found();
+    }
+    
+    auto resource = resource_factory_.create(path);
+    if (!resource) {
+        // 尝试创建新文件
+        std::ofstream(path.string()).close();
+        resource = resource_factory_.create(path);
+        if (!resource) {
+            co_return forbidden();
+        }
+    }
+    
+    // 检查是否是集合
+    if (resource->get_type() == ResourceType::COLLECTION) {
+        co_return method_not_allowed();
+    }
+    
+    // 写入文件
+    std::istringstream input(request.body);
+    co_await resource->put(input, request.content_length);
+    
+    HttpResponse response;
+    response.status_code = 201;
+    response.status_message = "Created";
+    co_return response;
+}
+
+boost::asio::awaitable<HttpResponse> 
+DavRequestHandler::process_delete(const HttpRequest& request) {
+    auto path = resolve_path(request.path);
+    
+    if (path.empty()) {
+        co_return not_found();
+    }
+    
+    auto resource = resource_factory_.create(path);
+    if (!resource) {
+        co_return not_found();
+    }
+    
+    bool removed = co_await resource->remove();
+    
+    HttpResponse response;
+    if (removed) {
+        response.status_code = 204;
+        response.status_message = "No Content";
+    } else {
+        response.status_code = 500;
+        response.status_message = "Internal Server Error";
+    }
+    
+    co_return response;
+}
+
+boost::asio::awaitable<HttpResponse> 
+DavRequestHandler::process_mkcol(const HttpRequest& request) {
+    auto path = resolve_path(request.path);
+    
+    if (path.empty()) {
+        co_return not_found();
+    }
+    
+    // 检查是否已存在
+    if (std::filesystem::exists(path)) {
+        HttpResponse response;
+        response.status_code = 405;
+        response.status_message = "Method Not Allowed";
+        response.body = "Collection already exists";
+        co_return response;
+    }
+    
+    std::error_code ec;
+    std::filesystem::create_directories(path, ec);
+    
+    HttpResponse response;
+    if (ec) {
+        response.status_code = 409;
+        response.status_message = "Conflict";
+        response.body = ec.message();
+    } else {
+        response.status_code = 201;
+        response.status_message = "Created";
+    }
+    
+    co_return response;
+}
+
+boost::asio::awaitable<HttpResponse> 
+DavRequestHandler::process_propfind(const HttpRequest& request) {
+    auto path = resolve_path(request.path);
+    
+    if (path.empty()) {
+        co_return not_found();
+    }
+    
+    auto depth = request.depth.empty() ? "0" : request.depth;
+    
+    // 构建多状态响应
+    DavXmlBuilder xml;
+    xml.add_declaration();
+    xml.start_multistatus();
+    
+    auto base_resource = resource_factory_.create(path);
+    
+    if (depth == "0" || depth == "1") {
+        // 处理指定资源
+        if (base_resource) {
+            xml.start_response(HttpParser::encodeFilename(request.path));
+            xml.start_propstat();
+            xml.start_prop();
+            co_await base_resource->get_properties(xml);
+            xml.end_prop();
+            xml.add_status(200, "OK");
+            xml.end_propstat();
+            xml.end_response();
+        }
+    }
+    
+    if (depth == "1") {
+        // 处理子资源
+        if (base_resource && base_resource->get_type() == ResourceType::COLLECTION) {
+            auto entries = co_await file_system_->read_directory(path.string());
+            
+            for (const auto& entry : entries) {
+                if (entry.path.filename() == "." || entry.path.filename() == "..") {
+                    continue;
+                }
+
+                auto child = resource_factory_.create(entry.path);
+                if (child) {
+                    std::string child_path = request.path;
+                    if (!child_path.ends_with('/')) child_path += '/';
+                    child_path += entry.path.filename().string();
+                    
+                    xml.start_response(HttpParser::encodeFilename(child_path));
+                    xml.start_propstat();
+                    xml.start_prop();
+                    co_await child->get_properties(xml);
+                    xml.end_prop();
+                    xml.add_status(200, "OK");
+                    xml.end_propstat();
+                    xml.end_response();
+                }
+            }
+        }
+    }
+    
+    xml.end_multistatus();
+    
+    HttpResponse response;
+    response.status_code = 207;
+    response.status_message = "Multi-Status";
+    response.body = xml.build();
+    OutputDebugStringA(response.body.c_str());
+    OutputDebugStringA("\n");
+    response.set_header("Content-Type", "text/xml; charset=utf-8");
+    response.set_header("Content-Length", std::to_string(response.body.size()));
+    
+    co_return response;
+}
+
+boost::asio::awaitable<HttpResponse> 
+DavRequestHandler::process_proppatch(const HttpRequest& request) {
+    // 简化实现：只返回成功
+    HttpResponse response;
+    response.status_code = 200;
+    response.status_message = "OK";
+    response.body = R"(<D:response xmlns:D="DAV:"><D:propstat><D:prop/></D:propstat></D:response>)";
+    response.set_header("Content-Type", "text/xml");
+    response.set_header("Content-Length", std::to_string(response.body.size()));
+    co_return response;
+}
+
+boost::asio::awaitable<HttpResponse> 
+DavRequestHandler::process_copy(const HttpRequest& request) {
+    auto src = resolve_path(request.path);
+    auto dst = resolve_destination(request.destination);
+    
+    if (src.empty() || dst.empty()) {
+        co_return not_found();
+    }
+    
+    auto resource = resource_factory_.create(src);
+    if (!resource) {
+        co_return not_found();
+    }
+    
+    co_await resource->copy(dst);
+    
+    HttpResponse response;
+    if (request.overwrite == "F" && std::filesystem::exists(dst)) {
+        response.status_code = 412;
+        response.status_message = "Precondition Failed";
+    } else {
+        response.status_code = 201;
+        response.status_message = "Created";
+    }
+    
+    co_return response;
+}
+
+boost::asio::awaitable<HttpResponse> 
+DavRequestHandler::process_move(const HttpRequest& request) {
+    auto src = resolve_path(request.path);
+    auto dst = resolve_destination(request.destination);
+    
+    if (src.empty() || dst.empty()) {
+        co_return not_found();
+    }
+    
+    auto resource = resource_factory_.create(src);
+    if (!resource) {
+        co_return not_found();
+    }
+    
+    co_await resource->move(dst);
+    
+    HttpResponse response;
+    if (request.overwrite == "F" && std::filesystem::exists(dst)) {
+        response.status_code = 412;
+        response.status_message = "Precondition Failed";
+    } else {
+        response.status_code = 201;
+        response.status_message = "Created";
+    }
+    
+    co_return response;
+}
+
+boost::asio::awaitable<HttpResponse> 
+DavRequestHandler::process_lock(const HttpRequest& request) {
+    auto path = resolve_path(request.path);
+    
+    if (path.empty()) {
+        co_return not_found();
+    }
+    
+    auto resource = resource_factory_.create(path);
+    if (!resource) {
+        co_return not_found();
+    }
+    
+    std::string owner = "WebDAV Client";
+    bool exclusive = request.body.find("exclusive") != std::string::npos;
+    
+    auto lock = co_await resource->lock(owner, exclusive);
+    
+    HttpResponse response;
+    response.status_code = 200;
+    response.status_message = "OK";
+    
+    std::string lock_response = std::format(
+        R"(<D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock>
+            <D:locktype><D:write/></D:locktype>
+            <D:lockscope>{}</D:lockscope>
+            <D:depth>Infinity</D:depth>
+            <D:owner>{}</D:owner>
+            <D:timeout>Second-900</D:timeout>
+            <D:locktoken><D:href>{}</D:href></D:locktoken>
+        </D:activelock></D:lockdiscovery></D:prop>)",
+        exclusive ? "<D:exclusive/>" : "<D:shared/>",
+        owner,
+        lock.token
+    );
+    
+    response.body = lock_response;
+    response.set_header("Content-Type", "text/xml");
+    response.set_header("Lock-Token", lock.token);
+    response.set_header("Content-Length", std::to_string(response.body.size()));
+    
+    co_return response;
+}
+
+boost::asio::awaitable<HttpResponse> 
+DavRequestHandler::process_unlock(const HttpRequest& request) {
+    auto path = resolve_path(request.path);
+    
+    if (path.empty()) {
+        co_return not_found();
+    }
+    
+    auto resource = resource_factory_.create(path);
+    if (!resource) {
+        co_return not_found();
+    }
+    
+    bool success = co_await resource->unlock(request.lock_token);
+    
+    HttpResponse response;
+    if (success) {
+        response.status_code = 204;
+        response.status_message = "No Content";
+    } else {
+        response.status_code = 409;
+        response.status_message = "Conflict";
+    }
+    
+    co_return response;
+}
+
+boost::asio::awaitable<HttpResponse> 
+DavRequestHandler::process_options(const HttpRequest& request) {
+    HttpResponse response;
+    response.status_code = 200;
+    response.status_message = "OK";
+    response.set_header("Allow", "GET, HEAD, PUT, DELETE, MKCOL, PROPFIND, "
+        "PROPPATCH, COPY, MOVE, LOCK, UNLOCK, OPTIONS");
+    response.set_header("DAV", "1, 2");
+    response.set_header("Content-Length", "0");
+    response.set_header("Content-Type", "text/html");
+    response.set_header("Server", "WebDAV Server");
+    response.set_header("Connection", "keep-alive");
+    response.set_header("MS-Author-Via", "DAV");
+    response.set_header("Date", getHttpDate());
+    co_return response;
+}
+
+std::filesystem::path DavRequestHandler::resolve_destination(
+    std::string_view destination) 
+{
+    // destination 可能是绝对URL或路径
+    // 简化实现：提取路径部分
+    if (destination.find("http://") == 0 || destination.find("https://") == 0) {
+        // 提取URL中的路径
+        auto pos = destination.find('/', 8); // 跳过http://host
+        if (pos != std::string_view::npos) {
+            destination = destination.substr(pos);
+        }
+    }
+    
+    return resolve_path(destination);
+}
+
+} // namespace webdav

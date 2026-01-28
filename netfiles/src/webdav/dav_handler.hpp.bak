@@ -1,0 +1,63 @@
+#ifndef DAV_HANDLER_HPP
+#define DAV_HANDLER_HPP
+
+#include <memory>
+#include <unordered_map>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/streambuf.hpp>
+#include "http_parser.hpp"
+#include "dav_resource.hpp"
+
+namespace webdav {
+
+/**
+ * WebDAV请求处理器
+ * 继承自ProtocolHandler接口
+ */
+class DavRequestHandler : public std::enable_shared_from_this<DavRequestHandler> {
+public:
+    DavRequestHandler(boost::asio::ip::tcp::socket socket,
+        boost::asio::any_io_executor& io_context,
+                      std::shared_ptr<core::IAsyncFileSystem> fs,
+                      const std::filesystem::path& root);
+    
+    // 启动处理
+    boost::asio::awaitable<void> handle_request();
+
+private:
+    boost::asio::ip::tcp::socket socket_;
+    boost::asio::any_io_executor& io_context_;
+    std::shared_ptr<core::IAsyncFileSystem> file_system_;
+    std::filesystem::path root_;
+    
+    DavResourceFactory resource_factory_;
+    
+    boost::asio::streambuf buffer_;
+    
+    // 方法处理
+    boost::asio::awaitable<HttpResponse> process_get(const HttpRequest& request);
+    boost::asio::awaitable<HttpResponse> process_head(const HttpRequest& request);
+    boost::asio::awaitable<HttpResponse> process_put(const HttpRequest& request);
+    boost::asio::awaitable<HttpResponse> process_delete(const HttpRequest& request);
+    boost::asio::awaitable<HttpResponse> process_mkcol(const HttpRequest& request);
+    boost::asio::awaitable<HttpResponse> process_propfind(const HttpRequest& request);
+    boost::asio::awaitable<HttpResponse> process_proppatch(const HttpRequest& request);
+    boost::asio::awaitable<HttpResponse> process_copy(const HttpRequest& request);
+    boost::asio::awaitable<HttpResponse> process_move(const HttpRequest& request);
+    boost::asio::awaitable<HttpResponse> process_lock(const HttpRequest& request);
+    boost::asio::awaitable<HttpResponse> process_unlock(const HttpRequest& request);
+    boost::asio::awaitable<HttpResponse> process_options(const HttpRequest& request);
+    
+    // 辅助方法
+    std::filesystem::path resolve_path(std::string_view request_path);
+    std::filesystem::path resolve_destination(std::string_view destination);
+    
+    HttpResponse method_not_allowed();
+    HttpResponse not_found();
+    HttpResponse forbidden();
+    HttpResponse precondition_failed(std::string_view message);
+};
+
+} // namespace webdav
+
+#endif // DAV_HANDLER_HPP
